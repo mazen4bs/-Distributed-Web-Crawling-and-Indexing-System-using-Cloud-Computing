@@ -5,10 +5,7 @@ import logging
 # Import necessary libraries for task queue, database, etc. (e.g., redis, cloud storage SDKs)
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - Master - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO,format='%(asctime)s - Master - %(levelname)s - %(message)s')
 
 def master_process():
     """
@@ -37,60 +34,59 @@ def master_process():
 
     logging.info(f"Active Crawler Nodes: {active_crawler_nodes}")
     logging.info(f"Active Indexer Nodes: {active_indexer_nodes}")
+    seed_urls = ["http://example.com", "http://example.org"]  # Example seed URLs - replace with actual seed URLs
+    urls_to_crawl_queue = seed_urls  # Simple list as initial queue - replace with a distributed queue
+    task_count = 0
+    crawler_tasks_assigned = 0
 
+    while urls_to_crawl_queue or crawler_tasks_assigned > 0:
+        # Continue as long as there are URLs to crawl or tasks in progress
 
-seed_urls = ["http://example.com", "http://example.org"]  # Example seed URLs - replace with actual seed URLs
-urls_to_crawl_queue = seed_urls  # Simple list as initial queue - replace with a distributed queue
-task_count = 0
-crawler_tasks_assigned = 0
+        # Check for completed crawler tasks and results from crawler nodes
+        if crawler_tasks_assigned > 0:
+            if comm.iprobe(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG, status=status):  # Non-blocking check for incoming messages
+                message_source = status.Get_source()
+                message_tag = status.Get_tag()
+                message_data = comm.recv(source=message_source, tag=message_tag)
 
-while urls_to_crawl_queue or crawler_tasks_assigned > 0:
-    # Continue as long as there are URLs to crawl or tasks in progress
+                if message_tag == 1:
+                    # Crawler completed task and sent back extracted URLs
+                    crawler_tasks_assigned -= 1
+                    new_urls = message_data  # Assuming message_data is a list of URLs
+                    if new_urls:
+                        urls_to_crawl_queue.extend(new_urls)  # Add newly discovered URLs to the queue
+                    logging.info(
+                        f"Master received URLs from Crawler {message_source}, "
+                        f"URLs in queue: {len(urls_to_crawl_queue)}, Tasks assigned: {crawler_tasks_assigned}"
+                    )
 
-    # Check for completed crawler tasks and results from crawler nodes
-    if crawler_tasks_assigned > 0:
-        if comm.iprobe(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG, status=status):  # Non-blocking check for incoming messages
-            message_source = status.Get_source()
-            message_tag = status.Get_tag()
-            message_data = comm.recv(source=message_source, tag=message_tag)
+                elif message_tag == 99:
+                    # Crawler node reports status/heartbeat
+                    logging.info(f"Crawler {message_source} status: {message_data}")  # Example status message
 
-            if message_tag == 1:
-                # Crawler completed task and sent back extracted URLs
-                crawler_tasks_assigned -= 1
-                new_urls = message_data  # Assuming message_data is a list of URLs
-                if new_urls:
-                    urls_to_crawl_queue.extend(new_urls)  # Add newly discovered URLs to the queue
-                logging.info(
-                    f"Master received URLs from Crawler {message_source}, "
-                    f"URLs in queue: {len(urls_to_crawl_queue)}, Tasks assigned: {crawler_tasks_assigned}"
-                )
+                elif message_tag == 999:
+                    # Crawler node reports error
+                    logging.error(f"Crawler {message_source} reported error: {message_data}")
+                    crawler_tasks_assigned -= 1  # Decrement task count even on error
 
-            elif message_tag == 99:
-                # Crawler node reports status/heartbeat
-                logging.info(f"Crawler {message_source} status: {message_data}")  # Example status message
+        # Assign new crawling tasks if there are URLs in the queue and available crawler nodes
+        while urls_to_crawl_queue and crawler_tasks_assigned < crawler_nodes:
+            # Limit tasks to available crawler nodes for simplicity in this skeleton
+            url_to_crawl = urls_to_crawl_queue.pop(0)  # Get URL from queue
+            # (Send URL to crawler node logic should go here)
+            # FIFO for simplicity
+            available_crawler_rank = active_crawler_nodes[crawler_tasks_assigned % len(active_crawler_nodes)]  # Simple round-robin assignment
+            task_id = task_count
+            task_count += 1
+            comm.send(url_to_crawl, dest=available_crawler_rank, tag=0)  # Tag 0 for task assignment
+            crawler_tasks_assigned += 1
+            logging.info(f"Master assigned task {task_id} (crawl {url_to_crawl}) to Crawler {available_crawler_rank}, Tasks assigned: {crawler_tasks_assigned}")
+            time.sleep(0.1)  # Small delay to prevent overwhelming master in this example
 
-            elif message_tag == 999:
-                # Crawler node reports error
-                logging.error(f"Crawler {message_source} reported error: {message_data}")
-                crawler_tasks_assigned -= 1  # Decrement task count even on error
-
-    # Assign new crawling tasks if there are URLs in the queue and available crawler nodes
-    while urls_to_crawl_queue and crawler_tasks_assigned < crawler_nodes:
-        # Limit tasks to available crawler nodes for simplicity in this skeleton
-        url_to_crawl = urls_to_crawl_queue.pop(0)  # Get URL from queue
-        # (Send URL to crawler node logic should go here)
-# FIFO for simplicity
-available_crawler_rank = active_crawler_nodes[crawler_tasks_assigned % len(active_crawler_nodes)]  # Simple round-robin assignment
-task_id = task_count
-task_count += 1
-comm.send(url_to_crawl, dest=available_crawler_rank, tag=0)  # Tag 0 for task assignment
-crawler_tasks_assigned += 1
-logging.info(f"Master assigned task {task_id} (crawl {url_to_crawl}) to Crawler {available_crawler_rank}, Tasks assigned: {crawler_tasks_assigned}")
-time.sleep(0.1)  # Small delay to prevent overwhelming master in this example
-time.sleep(1)  # Master node's main loop sleep - adjust as needed
-logging.info("Master node finished URL distribution. Waiting for crawlers to complete...")
-# In a real system, you would have more sophisticated shutdown and result aggregation logic
-print("Master Node Finished.")
+        time.sleep(1)  # Master node's main loop sleep - adjust as needed
+    logging.info("Master node finished URL distribution. Waiting for crawlers to complete...")
+    # In a real system, you would have more sophisticated shutdown and result aggregation logic
+    print("Master Node Finished.")
 
 if __name__ == '__main__':
     master_process()
