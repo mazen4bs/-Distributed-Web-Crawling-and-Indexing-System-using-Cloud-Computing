@@ -1,5 +1,4 @@
 from celery import Celery
-from celery.result import AsyncResult
 import logging
 import time
 
@@ -40,7 +39,21 @@ def monitor_tasks(results):
         else:
             logging.error(f"Task failed for URL: {result.id}")
 
+@app.task
+def heartbeat_task():
+    """Task to check if the worker nodes are alive."""
+    logging.info("Heartbeat task executed: Workers are alive.")
+
+def ping_workers():
+    """Ping the worker nodes to check if they are alive."""
+    while True:
+        heartbeat_task.apply_async()  # Trigger the heartbeat task periodically
+        time.sleep(10)  # Ping every 10 seconds
+
 if __name__ == '__main__':
     seed_urls = ['http://example.com', 'http://example.org']  # Replace with your seed URLs
     task_results = distribute_tasks(seed_urls)
     monitor_tasks(task_results)
+
+    # Start pinging the workers every 10 seconds
+    ping_workers()
