@@ -2,46 +2,46 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import logging
-from celery import Celery
-from celery.signals import worker_shutdown
-from celery.utils.log import get_task_logger
+import boto3
+import hashlib
+import json
 
-# Configure Celery app
-app = Celery('crawler', broker='redis://localhost:6379/0', backend='redis://localhost:6379/0')
-logger = get_task_logger(__name__)
+# Setup
+logging.basicConfig(level=logging.INFO)
+sqs = boto3.client('sqs', region_name='eu-north-1')
+s3 = boto3.client('s3')
 
-# Configure logging for worker node
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Constants (set your own)
+QUEUE_URL = 'https://sqs.eu-north-1.amazonaws.com/543442417201/mycrawlerQueue'
+BUCKET_NAME = 'distributed-crawler-data'
+CRAWL_DELAY = 1  # seconds
 
 class Crawler:
-    def __init__(self, crawl_delay=1):
-        self.delay = crawl_delay
+    def __init__(self, delay=1):
+        self.delay = delay
 
     def fetch_page(self, url):
-        """Fetch HTML content of the given URL."""
         try:
+            logging.info(f"🌐 Fetching: {url}")
             response = requests.get(url, timeout=5)
             response.raise_for_status()
             time.sleep(self.delay)
             return response.text
         except Exception as e:
-            logger.error(f"Failed to fetch {url}: {e}")
+            logging.error(f"❌ Failed to fetch {url}: {e}")
             return None
 
     def extract_text(self, html):
-        """Extract and clean visible text from HTML."""
         try:
             soup = BeautifulSoup(html, 'html.parser')
-            # Remove unwanted tags (e.g., script, style)
-            for script in soup(["script", "style"]):
-                script.decompose()
+            for tag in soup(['script', 'style']):
+                tag.decompose()
             return soup.get_text(separator=' ', strip=True)
         except Exception as e:
-            logger.error(f"Error extracting text: {e}")
+            logging.error(f"❌ Text extraction error: {e}")
             return ""
-
+            
     def extract_links(self, html, base_url):
-        """Extract all anchor tag href links."""
         try:
             soup = BeautifulSoup(html, 'html.parser')
             links = set()
@@ -50,36 +50,67 @@ class Crawler:
                 if href.startswith('http'):
                     links.add(href)
                 elif href.startswith('/'):
-                    links.add(base_url + href)
+                    links.add(base_url.rstrip('/') + href)
             return list(links)
         except Exception as e:
-            logger.error(f"Error extracting links: {e}")
+            logging.error(f"❌ Link extraction error: {e}")
             return []
 
-    def crawl(self, url):
-        """Main crawl logic: fetch, parse, extract."""
-        html = self.fetch_page(url)
-        if not html:
-            return None, []
-        text = self.extract_text(html)
-        links = self.extract_links(html, base_url=url)
-        return text, links
+    def upload_to_s3(self, html, url):
+        try:
+            filename = hashlib.md5(url.encode()).hexdigest() + '.html'
+            s3.put_object(
+                Bucket=BUCKET_NAME,
+                Key=filename,
+                Body=html,
+                ContentType='text/html'
+            )
+            logging.info(f"✅ Uploaded to S3: {filename}")
+            return filename
+        except Exception as e:
+            logging.error(f"❌ S3 upload failed: {e}")
+            return None
 
-@app.task
-def crawl_url_task(url):
-    """Task that is sent to a worker to crawl a URL"""
-    crawler = Crawler(crawl_delay=1)
-    text, new_links = crawler.crawl(url)
-    return {'url': url, 'text': text, 'new_links': new_links}
+def poll_and_crawl():
+    crawler = Crawler(delay=CRAWL_DELAY)
 
-@app.task
-def heartbeat_task():
-    """Task to simulate a heartbeat/ping from the worker node."""
-    logger.info("Worker is alive and processing.")
-    return "heartbeat successful"
+    while True:
+        messages = sqs.receive_message(QueueUrl=QUEUE_URL, MaxNumberOfMessages=1, WaitTimeSeconds=10)
+        if 'Messages' not in messages:
+            logging.info("📭 No messages in queue, waiting...")
+            continue
 
-@worker_shutdown.connect
-def on_worker_shutdown(sender, **kwargs):
-    """Gracefully handle worker shutdown."""
-    logger.info("Worker is shutting down gracefully.")
+        for message in messages['Messages']:
+            try:
+                raw_body = message['Body']
+                # Try to parse as JSON, if fails, treat as plain text URL
+                try:
+                    body = json.loads(raw_body)
+                    url = body.get('url')
+                except json.JSONDecodeError:
+                    # If not valid JSON, assume the message body is the URL itself
+                    url = raw_body.strip()
+                    logging.info(f"Treating message body as plain URL: {url}")
+
+                if not url:
+                    logging.warning("⚠️ No URL in message")
+                    continue
+
+                html = crawler.fetch_page(url)
+                if html:
+                    crawler.upload_to_s3(html, url)
+                    text = crawler.extract_text(html)
+                    links = crawler.extract_links(html, url)
+
+                    logging.info(f"🔍 Crawled {url}, extracted {len(links)} links")
+                    # Optionally, send the result somewhere
+                    # e.g., save to local file, send to indexer
+            except Exception as e:
+                logging.error(f"❌ Error processing message: {e}")
+            finally:
+                # Delete message after processing
+                sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=message['ReceiptHandle'])
+
+if __name__ == '__main__':
+    poll_and_crawl()
 
