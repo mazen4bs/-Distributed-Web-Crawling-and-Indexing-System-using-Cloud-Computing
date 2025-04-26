@@ -77,25 +77,12 @@ class MasterNode:
             time.sleep(10)  # Check every 10 seconds
     
     def heartbeat_check(self):
-        """Check if worker nodes are alive by monitoring their activity"""
-        while True:
-            # Check for any recent activity in the S3 bucket
-            try:
-                response = s3.list_objects_v2(
-                    Bucket=self.bucket_name,
-                    MaxKeys=10,
-                    # Check files created in the last 5 minutes
-                )
-                if 'Contents' in response:
-                    recent_files = [obj['Key'] for obj in response['Contents']]
-                    logging.info(f"Recent worker activity detected: {len(recent_files)} new files")
-                else:
-                    logging.warning("No recent worker activity detected!")
-            except Exception as e:
-                logging.error(f"❌ Failed to check worker activity: {e}")
-            
-            time.sleep(30)  # Check every 30 seconds
-    
+      """Replace with SQS-only monitoring"""
+      while True:
+          visible, in_flight = self.get_queue_status()
+          logging.info(f"Workers processing: {in_flight} URLs")
+          time.sleep(30)
+
     def start(self, seed_urls):
         """Start the master node with seed URLs"""
         # Add seed URLs to the queue
