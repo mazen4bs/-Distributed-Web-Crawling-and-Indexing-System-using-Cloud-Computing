@@ -1,59 +1,192 @@
-from celery import Celery
-import logging
+import requests
+from bs4 import BeautifulSoup
 import time
-
-# Initialize Celery app
-app = Celery('crawler', broker='redis://localhost:6379/0', backend='redis://localhost:6379/0')
-app.conf.task_acks_late = True
+import logging
+import boto3
+import hashlib
+import json
+import threading
+import queue
+import urllib.parse
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-@app.task
-def crawl_url_task(url):
-    """Task that is sent to a worker to crawl a URL"""
-    from crawler_node import Crawler
-    crawler = Crawler(crawl_delay=1)
-    text, new_links = crawler.crawl(url)
-    return {'url': url, 'text': text, 'new_links': new_links}
+# AWS S3 and SQS Clients
+sqs = boto3.client('sqs', region_name='eu-north-1')
+s3 = boto3.client('s3')
 
-def distribute_tasks(seed_urls):
-    """Distribute URLs to the task queue"""
-    results = []
-    for url in seed_urls:
-        result = crawl_url_task.apply_async(args=[url])
-        results.append(result)
-    return results
+# Constants (set your own)
+QUEUE_URL = 'https://sqs.eu-north-1.amazonaws.com/543442417201/mycrawlerQueue'
+BUCKET_NAME = 'distributed-crawler-data'
+CRAWL_DELAY = 1  # seconds
+MAX_QUEUE_SIZE = 1000  # Maximum URLs to keep in the queue
+MAX_WORKERS = 5  # Number of worker nodes to dispatch URLs to
 
-def monitor_tasks(results):
-    """Monitor and fetch results from tasks"""
-    for result in results:
-        # Wait for the result to be ready
-        while not result.ready():
-            time.sleep(1)
+class MasterNode:
+    def __init__(self, queue_url=QUEUE_URL, bucket_name=BUCKET_NAME):
+        self.queue_url = queue_url
+        self.bucket_name = bucket_name
+        self.visited_urls = set()
+        self.url_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+        self.lock = threading.Lock()
         
-        # Get the result
-        if result.successful():
-            logging.info(f"Task completed for URL: {result.result['url']}")
-            logging.info(f"Extracted {len(result.result['new_links'])} links.")
-        else:
-            logging.error(f"Task failed for URL: {result.id}")
+    def add_urls_to_queue(self, urls):
+        """Add URLs to the SQS queue"""
+        for url in urls:
+            if url not in self.visited_urls:
+                with self.lock:
+                    self.visited_urls.add(url)
+                
+                # Add URL to SQS queue
+                try:
+                    message_body = json.dumps({'url': url})
+                    sqs.send_message(
+                        QueueUrl=self.queue_url,
+                        MessageBody=message_body
+                    )
+                    logging.info(f"✅ Added to queue: {url}")
+                except Exception as e:
+                    logging.error(f"❌ Failed to add URL to queue: {url}, Error: {e}")
+    
+    def get_queue_status(self):
+        """Get the current status of the SQS queue"""
+        try:
+            response = sqs.get_queue_attributes(
+                QueueUrl=self.queue_url,
+                AttributeNames=['ApproximateNumberOfMessages', 'ApproximateNumberOfMessagesNotVisible']
+            )
+            
+            visible = int(response['Attributes']['ApproximateNumberOfMessages'])
+            in_flight = int(response['Attributes']['ApproximateNumberOfMessagesNotVisible'])
+            
+            logging.info(f"Queue Status: {visible} messages visible, {in_flight} messages in flight")
+            return visible, in_flight
+        except Exception as e:
+            logging.error(f"❌ Failed to get queue status: {e}")
+            return 0, 0
+    
+    def monitor_worker_activity(self):
+        """Monitor the S3 bucket for new results from worker nodes"""
+        # This is a placeholder for monitoring worker activity
+        # You could implement logic to check for new files in the S3 bucket
+        # or check CloudWatch metrics for SQS activity
+        while True:
+            visible, in_flight = self.get_queue_status()
+            logging.info(f"Monitoring workers: {in_flight} URLs being processed")
+            time.sleep(10)  # Check every 10 seconds
+    
+    def heartbeat_check(self):
+        """Check if worker nodes are alive by monitoring their activity"""
+        while True:
+            # Check for any recent activity in the S3 bucket
+            try:
+                response = s3.list_objects_v2(
+                    Bucket=self.bucket_name,
+                    MaxKeys=10,
+                    # Check files created in the last 5 minutes
+                )
+                if 'Contents' in response:
+                    recent_files = [obj['Key'] for obj in response['Contents']]
+                    logging.info(f"Recent worker activity detected: {len(recent_files)} new files")
+                else:
+                    logging.warning("No recent worker activity detected!")
+            except Exception as e:
+                logging.error(f"❌ Failed to check worker activity: {e}")
+            
+            time.sleep(30)  # Check every 30 seconds
+    
+    def start(self, seed_urls):
+        """Start the master node with seed URLs"""
+        # Add seed URLs to the queue
+        self.add_urls_to_queue(seed_urls)
+        
+        # Start monitoring thread
+        monitor_thread = threading.Thread(target=self.monitor_worker_activity)
+        monitor_thread.daemon = True
+        monitor_thread.start()
+        
+        # Start heartbeat thread
+        heartbeat_thread = threading.Thread(target=self.heartbeat_check)
+        heartbeat_thread.daemon = True
+        heartbeat_thread.start()
+        
+        logging.info("Master node started successfully")
+        
+        # Main loop to keep the master node running
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logging.info("Master node shutting down...")
 
-@app.task
-def heartbeat_task():
-    """Task to check if the worker nodes are alive."""
-    logging.info("Heartbeat task executed: Workers are alive.")
-
-def ping_workers():
-    """Ping the worker nodes to check if they are alive."""
-    while True:
-        heartbeat_task.apply_async()  # Trigger the heartbeat task periodically
-        time.sleep(10)  # Ping every 10 seconds
+def normalize_url(url):
+    """Normalize URL to avoid duplicates"""
+    parsed = urllib.parse.urlparse(url)
+    # Remove fragments
+    normalized = parsed._replace(fragment='').geturl()
+    # Ensure URL has a scheme
+    if not parsed.scheme:
+        normalized = 'http://' + normalized
+    return normalized
 
 if __name__ == '__main__':
-    seed_urls = ['http://example.com', 'http://example.org']  # Replace with your seed URLs
-    task_results = distribute_tasks(seed_urls)
-    monitor_tasks(task_results)
+    # Replace with your seed URLs
+    seed_urls = [
+        'http://example.com',
+        'http://example.org',
+        'https://www.python.org',
+        'https://aws.amazon.com'
+    ]
+    
+    # Normalize seed URLs
+    normalized_seeds = [normalize_url(url) for url in seed_urls]
+    
+    # Start master node
+    master = MasterNode()
+    master.start(normalized_seeds)
 
-    # Start pinging the workers every 10 seconds
-    ping_workers()
+
+"""
+
+# master_node.py
+
+import boto3
+import logging
+import json
+import time
+
+# Setup
+logging.basicConfig(level=logging.INFO)
+
+# AWS clients
+sqs = boto3.client('sqs', region_name='eu-north-1')
+
+# Constants (replace with your values)
+CRAWLER_QUEUE_URL = 'https://sqs.eu-north-1.amazonaws.com/543442417201/mycrawlerQueue'
+
+# Example seed URLs
+SEED_URLS = [
+    "https://example.com",
+    "https://news.ycombinator.com",
+    "https://docs.python.org/3/",
+    "https://www.wikipedia.org/"
+]
+
+def send_urls_to_crawler_queue(urls):
+    for url in urls:
+        try:
+            message = json.dumps({"url": url})
+            sqs.send_message(QueueUrl=CRAWLER_QUEUE_URL, MessageBody=message)
+            logging.info(f"✅ Sent to Crawler Queue: {url}")
+        except Exception as e:
+            logging.error(f"❌ Failed to send URL to Crawler Queue: {url} | Error: {e}")
+
+def main():
+    logging.info("🚀 Master Node starting...")
+    send_urls_to_crawler_queue(SEED_URLS)
+    logging.info("📬 All seed URLs sent to crawler queue.")
+
+if __name__ == '__main__':
+    main()
+"""
