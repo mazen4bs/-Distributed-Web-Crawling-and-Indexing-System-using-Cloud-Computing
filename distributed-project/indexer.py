@@ -18,16 +18,13 @@ class SimpleIndexer:
             objects = self.s3.list_objects_v2(Bucket=self.bucket_name)['Contents']
             for obj in objects:
                 file_key = obj['Key']
-                html = self.s3.get_object(Bucket=self.bucket_name, Key=file_key)['Body'].read().decode('utf-8')
-                url = self._extract_url_from_filename(file_key)  # Or store metadata
+                response = self.s3.get_object(Bucket=self.bucket_name, Key=file_key)
+                html = response['Body'].read().decode('utf-8')
+                url = response['Metadata'].get('original-url', file_key)  # Get URL from metadata
                 self._index_html(html, url)
             logging.info(f"✅ Indexed {len(objects)} pages")
         except Exception as e:
             logging.error(f"❌ S3 ingestion failed: {e}")
-
-    def _extract_url_from_filename(self, filename):
-        """Mock: Extract URL from filename (or use a metadata file)"""
-        return f"http://{filename.replace('.html', '')}"  # Simplified
 
     def _index_html(self, html, url):
         """Extract text and add to index"""
@@ -37,7 +34,7 @@ class SimpleIndexer:
             self.index[word].append(url)
 
     def search(self, keyword):
-        """Exact match search"""
+        """Exact match search (case-insensitive)"""
         return self.index.get(keyword.lower(), [])
 
 if __name__ == '__main__':
