@@ -19,6 +19,8 @@ CRAWL_DELAY = 1  # seconds
 class Crawler:
     def __init__(self, delay=1):
         self.delay = delay
+        self.s3 = boto3.client('s3')  # Initialize S3 client here
+        self.sqs = boto3.client('sqs') # Initialize SQS client if needed
 
     def fetch_page(self, url):
         try:
@@ -59,11 +61,12 @@ class Crawler:
     def upload_to_s3(self, html, url):
         try:
             filename = hashlib.md5(url.encode()).hexdigest() + '.html'
-            s3.put_object(
+            self.s3.put_object(
                 Bucket=BUCKET_NAME,
                 Key=filename,
                 Body=html,
-                ContentType='text/html'
+                ContentType='text/html',
+                Metadata={'original-url': url}
             )
             logging.info(f"✅ Uploaded to S3: {filename}")
             return filename
