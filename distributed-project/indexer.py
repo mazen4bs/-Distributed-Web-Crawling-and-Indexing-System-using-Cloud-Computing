@@ -1,43 +1,57 @@
-from mpi4py import MPI
-import time
+import boto3
 import logging
-# Import necessary libraries for indexing (e.g., whoosh, elasticsearch
-#client), database interaction, etc.
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - Indexer -%(levelname)s - %(message)s')
-def indexer_process():
- """
- Process for an indexer node.
- Receives web page content, indexes it, and handles search queries
-(basic).
- """
- comm = MPI.COMM_WORLD
- rank = comm.Get_rank()
- size = comm.Get_size()
- logging.info(f"Indexer node started with rank {rank} of {size}")
- # Initialize index, database connection, etc.
- # ... (Implementation needed - e.g., Whoosh index creation,
-#Elasticsearch connection) ...
- while True:
-  status = MPI.Status()
-  content_to_index = comm.recv(source=MPI.ANY_SOURCE, tag=2,status=status) # Receive content from crawlers (tag 2)
-  source_rank = status.Get_source()
+from bs4 import BeautifulSoup
+from collections import defaultdict
 
-  if not content_to_index: # Could be a shutdown signal 
-    logging.info(f"Indexer {rank} received shutdown signal.Exiting.")
-    break
-  
-  logging.info(f"Indexer {rank} received content from Crawler{source_rank} to index.")
-  
-  try:
- # --- Indexing Logic ---
-  # 1. Process the received content (e.g., text cleaning,tokenization)
- # 2. Update the search index with the content (e.g., using Whoosh, Elasticsearch)
-    time.sleep(1) # Simulate indexing delay
-    logging.info(f"Indexer {rank} indexed content from Crawler{source_rank}.")
-    comm.send(f"Indexer {rank} - Indexed content from Crawler{source_rank}", dest=0, tag=99) # Send status update to master (tag 99)
-  except Exception as e:
-    logging.error(f"Indexer {rank} error indexing content from Crawler {source_rank}: {e}")
-    comm.send(f"Indexer {rank} - Error indexing: {e}", dest=0,tag=999) # Report error to master (tag 999)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class SimpleIndexer:
+    def __init__(self, bucket_name):
+        self.s3 = boto3.client('s3')
+        self.bucket_name = bucket_name
+        self.index = defaultdict(list)  # {keyword: [url1, url2]}
+        
+    def ingest_from_s3(self):
+        """Fetch HTML files from S3 and build the index"""
+        try:
+            objects = self.s3.list_objects_v2(Bucket=self.bucket_name)['Contents']
+            for obj in objects:
+                file_key = obj['Key']
+                html = self.s3.get_object(Bucket=self.bucket_name, Key=file_key)['Body'].read().decode('utf-8')
+                url = self._extract_url_from_filename(file_key)  # Or store metadata
+                self._index_html(html, url)
+            logging.info(f"✅ Indexed {len(objects)} pages")
+        except Exception as e:
+            logging.error(f"❌ S3 ingestion failed: {e}")
+
+    def _extract_url_from_filename(self, filename):
+        """Mock: Extract URL from filename (or use a metadata file)"""
+        return f"http://{filename.replace('.html', '')}"  # Simplified
+
+    def _index_html(self, html, url):
+        """Extract text and add to index"""
+        soup = BeautifulSoup(html, 'html.parser')
+        text = soup.get_text().lower().split()  # Basic tokenization
+        for word in set(text):  # Dedupe per page
+            self.index[word].append(url)
+
+    def search(self, keyword):
+        """Exact match search"""
+        return self.index.get(keyword.lower(), [])
+
 if __name__ == '__main__':
-    indexer_process()
+    indexer = SimpleIndexer(bucket_name='distributed-crawler-data')
+    
+    # Step 1: Ingest data from S3
+    indexer.ingest_from_s3()
+    
+    # Step 2: Interactive search
+    while True:
+        query = input("Enter keyword (or 'quit'): ").strip()
+        if query == 'quit':
+            break
+        results = indexer.search(query)
+        print(f"🔍 Found {len(results)} results for '{query}':")
+        for url in results:
+            print(f"→ {url}")
