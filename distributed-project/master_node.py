@@ -1,179 +1,118 @@
-import requests
-from bs4 import BeautifulSoup
-import time
-import logging
 import boto3
-import hashlib
+import logging
 import json
+import time
 import threading
 import queue
 import urllib.parse
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# AWS S3 and SQS Clients
-sqs = boto3.client('sqs', region_name='eu-north-1')
-s3 = boto3.client('s3')
+# AWS Clients
+sqs = boto3.client("sqs", region_name="eu-north-1")
+s3 = boto3.client("s3")
 
-# Constants (set your own)
-QUEUE_URL = 'https://sqs.eu-north-1.amazonaws.com/543442417201/mycrawlerQueue'
-BUCKET_NAME = 'distributed-crawler-data'
-CRAWL_DELAY = 1  # seconds
-MAX_QUEUE_SIZE = 1000  # Maximum URLs to keep in the queue
-MAX_WORKERS = 5  # Number of worker nodes to dispatch URLs to
+# Constants
+CRAWLER_QUEUE_URL = "https://sqs.eu-north-1.amazonaws.com/543442417201/mycrawlerQueue"
+HEARTBEAT_QUEUE_URL = "https://sqs.eu-north-1.amazonaws.com/543442417201/mycrawlerHeartbeat"
+BUCKET_NAME = "distributed-crawler-data"
+MAX_QUEUE_SIZE = 1000
+TASK_TIMEOUT = 180  # seconds
 
 class MasterNode:
-    def __init__(self, queue_url=QUEUE_URL, bucket_name=BUCKET_NAME):
-        self.queue_url = queue_url
-        self.bucket_name = bucket_name
-        self.visited_urls = set()
+    def __init__(self):
         self.url_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
-        self.lock = threading.Lock()
-        
+        self.visited_urls = set()
+        self.task_status = {}  # url -> {timestamp, status}
+        self.crawler_status = {}  # crawler_id -> last_heartbeat_time
+        self.stats = {"total_urls": 0, "requeued": 0, "active_crawlers": 0, "failed_crawlers": 0}
+
     def add_urls_to_queue(self, urls):
-        """Add URLs to the SQS queue"""
         for url in urls:
             if url not in self.visited_urls:
-                with self.lock:
-                    self.visited_urls.add(url)
-                
-                # Add URL to SQS queue
-                try:
-                    message_body = json.dumps({'url': url})
-                    sqs.send_message(
-                        QueueUrl=self.queue_url,
-                        MessageBody=message_body
-                    )
-                    logging.info(f"✅ Added to queue: {url}")
-                except Exception as e:
-                    logging.error(f"❌ Failed to add URL to queue: {url}, Error: {e}")
-    
-    def get_queue_status(self):
-        """Get the current status of the SQS queue"""
-        try:
-            response = sqs.get_queue_attributes(
-                QueueUrl=self.queue_url,
-                AttributeNames=['ApproximateNumberOfMessages', 'ApproximateNumberOfMessagesNotVisible']
-            )
-            
-            visible = int(response['Attributes']['ApproximateNumberOfMessages'])
-            in_flight = int(response['Attributes']['ApproximateNumberOfMessagesNotVisible'])
-            
-            logging.info(f"Queue Status: {visible} messages visible, {in_flight} messages in flight")
-            return visible, in_flight
-        except Exception as e:
-            logging.error(f"❌ Failed to get queue status: {e}")
-            return 0, 0
-    
-    def monitor_worker_activity(self):
-        """Monitor the S3 bucket for new results from worker nodes"""
-        # This is a placeholder for monitoring worker activity
-        # You could implement logic to check for new files in the S3 bucket
-        # or check CloudWatch metrics for SQS activity
+                self.visited_urls.add(url)
+                message = json.dumps({"url": url})
+                sqs.send_message(QueueUrl=CRAWLER_QUEUE_URL, MessageBody=message)
+                self.task_status[url] = {"timestamp": time.time(), "status": "queued"}
+                self.stats["total_urls"] += 1
+                logging.info(f"✅ Sent URL to queue: {url}")
+
+    def monitor_heartbeats(self):
         while True:
-            visible, in_flight = self.get_queue_status()
-            logging.info(f"Monitoring workers: {in_flight} URLs being processed")
-            time.sleep(10)  # Check every 10 seconds
-    
-    def heartbeat_check(self):
-      """Replace with SQS-only monitoring"""
-      while True:
-          visible, in_flight = self.get_queue_status()
-          logging.info(f"Workers processing: {in_flight} URLs")
-          time.sleep(30)
+            messages = sqs.receive_message(
+                QueueUrl=HEARTBEAT_QUEUE_URL, MaxNumberOfMessages=10, WaitTimeSeconds=10
+            )
+            if "Messages" in messages:
+                for msg in messages["Messages"]:
+                    try:
+                        data = json.loads(msg["Body"])
+                        cid = data["crawler_id"]
+                        self.crawler_status[cid] = time.time()
+                        logging.info(f"💓 Heartbeat from {cid} | Crawled: {data['crawled']} | Failed: {data['failed']}")
+                    except Exception as e:
+                        logging.error(f"❌ Error processing heartbeat: {e}")
+                    finally:
+                        sqs.delete_message(QueueUrl=HEARTBEAT_QUEUE_URL, ReceiptHandle=msg["ReceiptHandle"])
+
+    def check_task_timeouts(self):
+        while True:
+            time.sleep(15)
+            now = time.time()
+            for url, meta in list(self.task_status.items()):
+                if meta["status"] == "queued":
+                    if now - meta["timestamp"] > TASK_TIMEOUT:
+                        logging.warning(f"⏱️ Task timeout for URL: {url}, requeuing...")
+                        message = json.dumps({"url": url})
+                        sqs.send_message(QueueUrl=CRAWLER_QUEUE_URL, MessageBody=message)
+                        self.task_status[url]["timestamp"] = time.time()
+                        self.stats["requeued"] += 1
+
+    def monitor_crawler_health(self):
+        while True:
+            time.sleep(30)
+            now = time.time()
+            active = 0
+            failed = 0
+            for cid, ts in self.crawler_status.items():
+                if now - ts <= 90:
+                    active += 1
+                else:
+                    failed += 1
+                    logging.warning(f"❌ Crawler {cid} considered FAILED (no heartbeat in 90s)")
+            self.stats["active_crawlers"] = active
+            self.stats["failed_crawlers"] = failed
+            logging.info(f"📊 Crawler Status | Active: {active} | Failed: {failed}")
+
+    def report_stats(self):
+        while True:
+            time.sleep(60)
+            logging.info(f"📈 Stats: {self.stats}")
 
     def start(self, seed_urls):
-        """Start the master node with seed URLs"""
-        # Add seed URLs to the queue
         self.add_urls_to_queue(seed_urls)
-        
-        # Start monitoring thread
-        monitor_thread = threading.Thread(target=self.monitor_worker_activity)
-        monitor_thread.daemon = True
-        monitor_thread.start()
-        
-        # Start heartbeat thread
-        heartbeat_thread = threading.Thread(target=self.heartbeat_check)
-        heartbeat_thread.daemon = True
-        heartbeat_thread.start()
-        
-        logging.info("Master node started successfully")
-        
-        # Main loop to keep the master node running
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logging.info("Master node shutting down...")
+
+        threading.Thread(target=self.monitor_heartbeats, daemon=True).start()
+        threading.Thread(target=self.check_task_timeouts, daemon=True).start()
+        threading.Thread(target=self.monitor_crawler_health, daemon=True).start()
+        threading.Thread(target=self.report_stats, daemon=True).start()
+
+        logging.info("🚀 Master Node started with heartbeat & timeout monitoring")
+        while True:
+            time.sleep(1)
 
 def normalize_url(url):
-    """Normalize URL to avoid duplicates"""
     parsed = urllib.parse.urlparse(url)
-    # Remove fragments
-    normalized = parsed._replace(fragment='').geturl()
-    # Ensure URL has a scheme
-    if not parsed.scheme:
-        normalized = 'http://' + normalized
-    return normalized
+    normalized = parsed._replace(fragment="").geturl()
+    return normalized if parsed.scheme else "http://" + normalized
 
-if __name__ == '__main__':
-    # Replace with your seed URLs
+if __name__ == "__main__":
     seed_urls = [
-        'http://example.com',
-        'http://example.org',
-        'https://www.python.org',
-        'https://aws.amazon.com'
+        "http://example.com",
+        "https://aws.amazon.com",
+        "https://www.python.org",
+        "https://docs.python.org/3/"
     ]
-    
-    # Normalize seed URLs
     normalized_seeds = [normalize_url(url) for url in seed_urls]
-    
-    # Start master node
     master = MasterNode()
     master.start(normalized_seeds)
-
-
-"""
-
-# master_node.py
-
-import boto3
-import logging
-import json
-import time
-
-# Setup
-logging.basicConfig(level=logging.INFO)
-
-# AWS clients
-sqs = boto3.client('sqs', region_name='eu-north-1')
-
-# Constants (replace with your values)
-CRAWLER_QUEUE_URL = 'https://sqs.eu-north-1.amazonaws.com/543442417201/mycrawlerQueue'
-
-# Example seed URLs
-SEED_URLS = [
-    "https://example.com",
-    "https://news.ycombinator.com",
-    "https://docs.python.org/3/",
-    "https://www.wikipedia.org/"
-]
-
-def send_urls_to_crawler_queue(urls):
-    for url in urls:
-        try:
-            message = json.dumps({"url": url})
-            sqs.send_message(QueueUrl=CRAWLER_QUEUE_URL, MessageBody=message)
-            logging.info(f"✅ Sent to Crawler Queue: {url}")
-        except Exception as e:
-            logging.error(f"❌ Failed to send URL to Crawler Queue: {url} | Error: {e}")
-
-def main():
-    logging.info("🚀 Master Node starting...")
-    send_urls_to_crawler_queue(SEED_URLS)
-    logging.info("📬 All seed URLs sent to crawler queue.")
-
-if __name__ == '__main__':
-    main()
-"""
