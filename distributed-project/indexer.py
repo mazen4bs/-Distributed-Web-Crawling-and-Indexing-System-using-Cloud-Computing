@@ -1,6 +1,9 @@
 import os
 import boto3
 import logging
+import json
+import time
+import socket
 from bs4 import BeautifulSoup
 from whoosh.index import create_in, open_dir
 from whoosh.fields import Schema, TEXT, ID
@@ -14,9 +17,12 @@ BUCKET_NAME = "distributed-crawler-data"
 INDEX_DIR = "indexdir"
 BACKUP_BUCKET = "distributed-index-backups"
 LOG_FILE = "indexed_files.log"
+INDEXER_ID = socket.gethostname()
+HEARTBEAT_QUEUE_URL = "https://sqs.eu-north-1.amazonaws.com/543442417201/myindexerHeartbeat"
 
 # AWS clients
-s3 = boto3.client("s3")
+s3 = boto3.client("s3", region_name="eu-north-1")
+sqs = boto3.client("sqs", region_name="eu-north-1")
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -63,6 +69,22 @@ def extract_text_from_html(html, url="unknown"):
     content = soup.get_text(separator=" ", strip=True)
     return title, content
 
+def send_indexer_heartbeat(indexed_count):
+    try:
+        heartbeat = {
+            "indexer_id": INDEXER_ID,
+            "timestamp": time.time(),
+            "status": "alive",
+            "indexed": indexed_count
+        }
+        sqs.send_message(
+            QueueUrl=HEARTBEAT_QUEUE_URL,
+            MessageBody=json.dumps(heartbeat)
+        )
+        logging.info("💓 Indexer heartbeat sent")
+    except Exception as e:
+        logging.error(f"❌ Failed to send indexer heartbeat: {e}")
+
 def ingest_from_s3():
     indexed_count = 0
     already_indexed = load_indexed_keys()
@@ -91,6 +113,7 @@ def ingest_from_s3():
 
         writer.commit()
         logging.info(f"📦 Total indexed this session: {indexed_count}")
+        send_indexer_heartbeat(indexed_count)
 
     except Exception as e:
         logging.error(f"❌ Indexing failed: {e}")
@@ -98,11 +121,11 @@ def ingest_from_s3():
 def backup_indexdir_to_s3():
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     archive_name = f"indexdir_backup_{timestamp}.tar.gz"
-    
+
     # Create tar.gz
     with tarfile.open(archive_name, "w:gz") as tar:
         tar.add(INDEX_DIR, arcname=os.path.basename(INDEX_DIR))
-    
+
     # Upload to S3
     try:
         s3.upload_file(archive_name, BACKUP_BUCKET, archive_name)
