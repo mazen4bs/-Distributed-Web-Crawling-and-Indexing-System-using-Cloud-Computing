@@ -7,22 +7,24 @@ from whoosh.fields import Schema, TEXT, ID
 from whoosh.analysis import StemmingAnalyzer
 from whoosh.qparser import MultifieldParser
 
-# Setup
+# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Constants
 BUCKET_NAME = "distributed-crawler-data"
 INDEX_DIR = "indexdir"
 
 # AWS S3 client
 s3 = boto3.client("s3")
 
-# Define Whoosh schema
+# Whoosh schema definition
 schema = Schema(
     url=ID(stored=True, unique=True),
     title=TEXT(stored=True, analyzer=StemmingAnalyzer()),
     content=TEXT(stored=True, analyzer=StemmingAnalyzer())
 )
 
-# Create or open the index
+# Create or open Whoosh index
 if not os.path.exists(INDEX_DIR):
     os.mkdir(INDEX_DIR)
     ix = create_in(INDEX_DIR, schema)
@@ -30,20 +32,19 @@ else:
     ix = open_dir(INDEX_DIR)
 
 def extract_text_from_html(html, url="unknown"):
-    """Extract page title and visible content text."""
+    """Extract the title and visible text content from HTML."""
     soup = BeautifulSoup(html, "html.parser")
 
-    # Title fallback: use <title> or fallback to first <h1>
+    # Try title tag, fallback to <h1>, then to "No Title"
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
     else:
-        h1 = soup.find('h1')
-        if h1 and h1.string:
-            title = h1.string.strip()
-        else:
-            title = "No Title"
+        h1 = soup.find("h1")
+        title = h1.string.strip() if h1 and h1.string else "No Title"
+        if title == "No Title":
             logging.warning(f"⚠️ No valid title found for: {url}")
 
+    # Remove unwanted tags
     for tag in soup(["script", "style"]):
         tag.decompose()
 
@@ -51,10 +52,13 @@ def extract_text_from_html(html, url="unknown"):
     return title, content
 
 def ingest_from_s3():
-    """Download HTML files from S3 and index them."""
+    """Download HTML files from S3 and build the search index."""
+    indexed_count = 0
     try:
-        objects = s3.list_objects_v2(Bucket=BUCKET_NAME).get("Contents", [])
+        response = s3.list_objects_v2(Bucket=BUCKET_NAME)
+        objects = response.get("Contents", [])
         writer = ix.writer()
+
         for obj in objects:
             key = obj["Key"]
             response = s3.get_object(Bucket=BUCKET_NAME, Key=key)
@@ -68,14 +72,18 @@ def ingest_from_s3():
                 title=title,
                 content=content
             )
+
+            indexed_count += 1
             logging.info(f"✅ Indexed: {url} | Title: {title}")
+
         writer.commit()
-        logging.info(f"📦 Finished indexing {len(objects)} pages")
+        logging.info(f"📦 Finished indexing {indexed_count} pages")
+
     except Exception as e:
         logging.error(f"❌ Indexing failed: {e}")
 
 def interactive_search():
-    """Search interface with instructions."""
+    """Start a simple keyword/phrase/boolean search prompt."""
     print("\n🔎 Welcome to the Distributed Web Search Engine")
     print("Enter a keyword, phrase (in quotes), or boolean query (e.g., python AND aws)")
     print("Type 'quit' to exit.\n")
