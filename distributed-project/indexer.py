@@ -15,6 +15,7 @@ import tarfile
 import socket
 import json
 import time
+import threading
 
 
 # Constants
@@ -25,6 +26,7 @@ LOG_FILE = "indexed_files.log"
 INDEXER_ID = socket.gethostname()
 HEARTBEAT_QUEUE_URL = "https://sqs.eu-north-1.amazonaws.com/543442417201/myindexerHeartbeat"
 CRAWLER_HEARTBEAT_QUEUE_URL = "https://sqs.eu-north-1.amazonaws.com/543442417201/mycrawlerHeartbeat"
+HEARTBEAT_INTERVAL = 60  # Send heartbeat every 60 seconds
 
 # AWS clients
 s3 = boto3.client("s3", region_name="eu-north-1")
@@ -32,6 +34,10 @@ sqs = boto3.client("sqs", region_name="eu-north-1")
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Global variables for stats
+indexed_count = 0
+heartbeat_running = True
 
 # Whoosh schema
 def create_schema():
@@ -89,12 +95,26 @@ def send_indexer_heartbeat(indexed_count):
             QueueUrl=HEARTBEAT_QUEUE_URL,
             MessageBody=json.dumps(heartbeat)
         )
-        logging.info("💓 Indexer heartbeat sent")
+        # Removed heartbeat sent message
     except Exception as e:
         logging.error(f"❌ Failed to send indexer heartbeat: {e}")
 
+def heartbeat_thread():
+    """Thread to send regular heartbeats"""
+    global indexed_count, heartbeat_running
+    
+    logging.info("🕒 Starting regular heartbeat thread")
+    
+    while heartbeat_running:
+        try:
+            send_indexer_heartbeat(indexed_count)
+            time.sleep(HEARTBEAT_INTERVAL)
+        except Exception as e:
+            logging.error(f"❌ Error in heartbeat thread: {e}")
+            time.sleep(5)  # Back off on errors
+
 def ingest_from_s3():
-    indexed_count = 0
+    global indexed_count
     already_indexed = load_indexed_keys()
 
     try:
@@ -177,8 +197,6 @@ def show_status():
         print(f"❌ Failed to fetch status: {e}")
 
 
-from whoosh.qparser import MultifieldParser, OrGroup, OperatorsPlugin
-
 def interactive_search():
     print("\n🔎 Welcome to the Distributed Web Search Engine")
     print("Type a keyword or phrase, or boolean search (e.g., AI AND python).")
@@ -218,6 +236,20 @@ def interactive_search():
 
 
 if __name__ == "__main__":
-    ingest_from_s3()
-    backup_indexdir_to_s3()
-    interactive_search()
+    try:
+        # Start the heartbeat thread first to ensure continuous heartbeats
+        heartbeat_thread = threading.Thread(target=heartbeat_thread, daemon=True)
+        heartbeat_thread.start()
+        logging.info(f"🚀 Indexer node {INDEXER_ID} started")
+        
+        # Run the main indexer processes
+        ingest_from_s3()
+        backup_indexdir_to_s3()
+        interactive_search()
+        
+    except KeyboardInterrupt:
+        logging.info("👋 Indexer stopping")
+    finally:
+        # Ensure clean shutdown
+        heartbeat_running = False
+        logging.info("💤 Indexer shutting down")
