@@ -28,8 +28,19 @@ class MasterNode:
         self.task_status = {}  # url -> {timestamp, status}
         self.crawler_status = {}  # crawler_id -> last_heartbeat_time
         self.stats = {"total_urls": 0, "requeued": 0, "active_crawlers": 0, "failed_crawlers": 0}
+        self.seed_urls = []  # Store seed URLs
 
-    def add_urls_to_queue(self, urls):
+    def add_urls_to_queue(self, urls, source="seed"):
+        """Add URLs to the crawl queue
+        
+        Args:
+            urls: List of URLs to add to the queue
+            source: Source of the URLs (e.g., 'seed', 'user', etc.)
+        """
+        # Track seed URLs separately
+        if source == "seed":
+            self.seed_urls.extend(urls)
+            
         for url in urls:
             # Normalize URL to avoid duplicates
             url = normalize_url(url)
@@ -42,9 +53,25 @@ class MasterNode:
                     sqs.send_message(QueueUrl=CRAWLER_QUEUE_URL, MessageBody=message)
                     self.task_status[url] = {"timestamp": time.time(), "status": "queued"}
                     self.stats["total_urls"] += 1
-                    logging.info(f"✅ Sent URL to queue: {url}")
+                    
+                    # Log with source information for better tracking
+                    if source == "user":
+                        logging.info(f"👤 User submitted URL to queue: {url}")
+                    else:
+                        logging.info(f"✅ Sent URL to queue: {url}")
+                        
                 except Exception as e:
                     logging.error(f"❌ Failed to send URL to queue: {url}, {str(e)}")
+            else:
+                logging.info(f"⏭️ Skipping already visited URL: {url}")
+
+    def add_user_urls(self, urls):
+        """Add user-submitted URLs to the queue"""
+        # User URLs are added to the same pool as seeds, just with a different source label
+        logging.info(f"👤 Received {len(urls)} URLs from user")
+        self.add_urls_to_queue(urls, source="user")
+        # Update stats to show the user submissions
+        logging.info(f"📊 Total URLs in system: {self.stats['total_urls']} (including user submissions)")
 
     def monitor_heartbeats(self):
         while True:
@@ -141,8 +168,11 @@ class MasterNode:
             except Exception as e:
                 logging.error(f"❌ Error reporting stats: {e}")
 
-    def start(self, seed_urls):
-        self.add_urls_to_queue(seed_urls)
+    def start(self, seed_urls=None):
+        """Start the master node with optional seed URLs"""
+        if seed_urls:
+            self.add_urls_to_queue(seed_urls, source="seed")
+            logging.info(f"🌱 Added {len(seed_urls)} seed URLs to the crawl queue")
 
         # Start only the essential monitoring threads
         threading.Thread(target=self.monitor_heartbeats, daemon=True).start()
@@ -152,7 +182,6 @@ class MasterNode:
         threading.Thread(target=self.report_stats, daemon=True).start()
 
         logging.info("🚀 Master Node started with heartbeat & timeout monitoring")
-        logging.info(f"🌱 Added {len(seed_urls)} seed URLs to the crawl queue")
         
         # Keep main thread alive
         while True:
