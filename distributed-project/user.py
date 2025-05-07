@@ -11,19 +11,13 @@ from colorama import Fore, Style
 import logging
 from datetime import datetime
 import socket
-
-# Import the search functionality directly from the indexer
-try:
-    from indexer import interactive_search
-except ImportError:
-    pass  # We'll handle this gracefully later
+import importlib.util
 
 # Initialize colorama for cross-platform colored terminal output
 colorama.init(autoreset=True)
 
-# Constants - Use master node directly instead of the queue
-MASTER_HOST = "localhost"  # Change this to your master node's hostname/IP if needed
-MASTER_PORT = 8000  # This will be used for direct communication with the master
+# Constants - SQS queue for direct submission to master node
+CRAWLER_QUEUE_URL = "https://sqs.eu-north-1.amazonaws.com/543442417201/mycrawlerQueue"
 
 # Setup logging
 logging.basicConfig(
@@ -39,6 +33,7 @@ logger = logging.getLogger(__name__)
 # AWS setup
 try:
     # Use standard boto3 credential resolution (environment vars, AWS config files, etc.)
+    sqs = boto3.client("sqs", region_name="eu-north-1")
     s3 = boto3.client("s3", region_name="eu-north-1")
 except Exception as e:
     logger.error(f"Failed to initialize AWS clients: {e}")
@@ -48,6 +43,9 @@ except Exception as e:
 def normalize_url(url):
     """Normalize URL to canonical form"""
     try:
+        # Remove any surrounding quotes if present
+        url = url.strip('"\'')
+        
         # Add scheme if missing
         if not url.startswith('http://') and not url.startswith('https://'):
             url = 'http://' + url
@@ -62,10 +60,7 @@ def normalize_url(url):
         return url  # Return original on error
 
 def send_urls_to_master(urls):
-    """Send URLs to the master node for processing"""
-    import socket
-    import json
-    
+    """Send URLs directly to the SQS queue that the master node monitors"""
     if not urls:
         print(f"{Fore.YELLOW}No URLs provided.{Style.RESET_ALL}")
         return
@@ -75,50 +70,53 @@ def send_urls_to_master(urls):
     success_count = 0
     failed_urls = []
     
-    # Import the MasterNode class from master_node module to use its functionality
-    try:
-        from master_node import MasterNode, normalize_url
-        
-        # Create a temporary instance of MasterNode to use its add_urls_to_queue method
-        master = MasterNode()
-        
-        # Normalize URLs first
-        normalized_urls = [normalize_url(url.strip()) for url in urls if url.strip()]
-        
-        # Add URLs to master's queue
-        master.add_urls_to_queue(normalized_urls)
-        
-        success_count = len(normalized_urls)
-        
-        for url in normalized_urls:
-            print(f"{Fore.GREEN}✓ URL sent to master: {url}{Style.RESET_ALL}")
+    for url in urls:
+        # Normalize URL
+        normalized_url = normalize_url(url.strip())
+        if not normalized_url:
+            continue
             
-    except ImportError:
-        print(f"{Fore.RED}Error: Could not import MasterNode. Make sure master_node.py is in the same directory.{Style.RESET_ALL}")
-        return 0
-    except Exception as e:
-        failed_urls = urls
-        logger.error(f"Failed to send URLs to master: {e}")
-        print(f"{Fore.RED}✗ Failed to send URLs to master: {e}{Style.RESET_ALL}")
-        
+        try:
+            # Format message the same way the master node expects it
+            message = json.dumps({"url": normalized_url})
+            
+            # Send directly to the SQS queue
+            sqs.send_message(QueueUrl=CRAWLER_QUEUE_URL, MessageBody=message)
+            success_count += 1
+            print(f"{Fore.GREEN}✓ URL sent to master: {normalized_url}{Style.RESET_ALL}")
+        except Exception as e:
+            failed_urls.append(url)
+            logger.error(f"Failed to send URL {url}: {e}")
+            print(f"{Fore.RED}✗ Failed to send URL: {url} - {e}{Style.RESET_ALL}")
+    
     return success_count
 
 def launch_dashboard():
-    """Launch the system dashboard in a new process"""
+    """Launch the system dashboard in a new process with improved path detection"""
     try:
         print(f"{Fore.CYAN}Starting dashboard...{Style.RESET_ALL}")
-        # Get the path to the dashboard.py file
-        dashboard_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.py")
+        
+        # Get the current directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        print(f"Looking for dashboard in: {current_dir}")
+        
+        # Try with capitalized name first (which we know exists based on your folder structure)
+        dashboard_path = os.path.join(current_dir, "Dashboard.py")
         
         if not os.path.exists(dashboard_path):
-            # Try with capitalized name
-            dashboard_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Dashboard.py")
-            if not os.path.exists(dashboard_path):
-                print(f"{Fore.RED}Error: Dashboard.py not found{Style.RESET_ALL}")
-                return False
+            # Try lowercase as fallback
+            dashboard_path = os.path.join(current_dir, "dashboard.py")
+            
+        if not os.path.exists(dashboard_path):
+            print(f"{Fore.RED}Error: Dashboard.py not found in {current_dir}{Style.RESET_ALL}")
+            return False
+        
+        print(f"Found dashboard at: {dashboard_path}")
         
         # Launch the dashboard in a new process
-        subprocess.Popen([sys.executable, dashboard_path])
+        cmd = [sys.executable, dashboard_path]
+        print(f"Executing: {' '.join(cmd)}")
+        subprocess.Popen(cmd)
         print(f"{Fore.GREEN}Dashboard launched. Press Ctrl+C in the dashboard window to exit when done.{Style.RESET_ALL}")
         return True
     except Exception as e:
@@ -128,19 +126,30 @@ def launch_dashboard():
 def launch_search():
     """Launch the search interface using the indexer's interactive_search function"""
     try:
-        # Check if we successfully imported the function
-        if 'interactive_search' not in globals():
-            from indexer import interactive_search
+        # Get the current directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Import indexer using importlib
+        indexer_path = os.path.join(current_dir, "indexer.py")
+        if not os.path.exists(indexer_path):
+            print(f"{Fore.RED}Error: indexer.py not found in {current_dir}{Style.RESET_ALL}")
+            return False
             
+        spec = importlib.util.spec_from_file_location("indexer", indexer_path)
+        indexer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(indexer)
+        
         # Launch the interactive search from the indexer module
         print(f"{Fore.CYAN}Starting search interface from indexer module...{Style.RESET_ALL}")
-        interactive_search()
+        indexer.interactive_search()
         return True
-    except ImportError:
-        print(f"{Fore.RED}Error: Could not import search function from indexer.py. Make sure it's in the same directory.{Style.RESET_ALL}")
+    except ImportError as e:
+        print(f"{Fore.RED}Error importing indexer module: {e}{Style.RESET_ALL}")
         return False
     except Exception as e:
         print(f"{Fore.RED}Error launching search interface: {e}{Style.RESET_ALL}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def main_menu():
