@@ -17,7 +17,6 @@ colorama.init(autoreset=True)
 try:
     # Use standard boto3 credential resolution (environment vars, AWS config files, etc.)
     sqs = boto3.client("sqs", region_name="eu-north-1")
-    s3 = boto3.client("s3", region_name="eu-north-1")
 except Exception as e:
     print(f"Failed to initialize AWS clients: {e}")
     sys.exit(1)
@@ -26,8 +25,6 @@ except Exception as e:
 crawler_queue_url = "https://sqs.eu-north-1.amazonaws.com/543442417201/mycrawlerHeartbeat"
 indexer_queue_url = "https://sqs.eu-north-1.amazonaws.com/543442417201/myindexerHeartbeat"
 work_queue_url = "https://sqs.eu-north-1.amazonaws.com/543442417201/mycrawlerQueue"
-BUCKET_NAME = "distributed-crawler-data"
-BACKUP_BUCKET = "distributed-index-backups"
 
 # Constants 
 REFRESH_INTERVAL = 3  # seconds (reduced for faster updates)
@@ -101,22 +98,6 @@ def fetch_queue_stats():
         return visible, in_flight
     except Exception as e:
         debug(f"Error getting queue stats: {e}")
-        return 0, 0
-
-def fetch_s3_stats():
-    """Get statistics about S3 storage"""
-    try:
-        # Get crawled content stats
-        content_response = s3.list_objects_v2(Bucket=BUCKET_NAME)
-        content_count = content_response.get('KeyCount', 0)
-        
-        # Get index backup stats
-        backup_response = s3.list_objects_v2(Bucket=BACKUP_BUCKET)
-        backup_count = backup_response.get('KeyCount', 0)
-        
-        return content_count, backup_count
-    except Exception as e:
-        debug(f"Error getting S3 stats: {e}")
         return 0, 0
 
 def calculate_rates():
@@ -404,9 +385,8 @@ def display_dashboard():
             # Calculate performance metrics
             crawl_rate, index_rate, error_rate = calculate_rates()
             
-            # Get queue and storage stats
+            # Get queue stats
             queue_visible, queue_in_flight = fetch_queue_stats()
-            content_count, backup_count = fetch_s3_stats()
 
             # Clear screen 
             os.system('cls' if os.name == 'nt' else 'clear')
@@ -430,7 +410,6 @@ def display_dashboard():
                 print(f"  ⚠️  Inactive Nodes: {node_health['inactive_crawlers']} crawlers, {node_health['inactive_indexers']} indexers")
             
             print(f"  📑 Queue Status: {queue_visible} visible, {queue_in_flight} in processing")
-            print(f"  📦 Storage: {content_count} files crawled, {backup_count} index backups")
             
             # Performance metrics with colors for error rate
             print(f"\n📈 {Fore.CYAN}PERFORMANCE METRICS (per minute):{Style.RESET_ALL}")
