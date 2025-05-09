@@ -9,6 +9,8 @@ import socket
 from botocore.exceptions import ClientError
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
+from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
 
 # Setup logging
 logging.basicConfig(
@@ -40,6 +42,7 @@ class Crawler:
         self.uploaded_count = 0
         self.max_retries = max_retries
         self.session = self._create_session()
+        self.robots_cache = {}  # Cache for robots.txt parsers
         
     def _create_session(self):
         """Create a requests session with retry logic"""
@@ -55,8 +58,72 @@ class Crawler:
         session.mount("http://", adapter)
         return session
 
+    def get_robots_parser(self, url):
+        """Get or create a robots.txt parser for the domain"""
+        parsed_url = urlparse(url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        
+        # Return cached parser if available and not expired (1 hour cache)
+        if base_url in self.robots_cache:
+            parser, timestamp = self.robots_cache[base_url]
+            if time.time() - timestamp < 3600:  # 1 hour cache
+                return parser
+                
+        # Create new parser
+        try:
+            robots_url = f"{base_url}/robots.txt"
+            logging.info(f"📋 Fetching robots.txt: {robots_url}")
+            
+            parser = RobotFileParser()
+            parser.set_url(robots_url)
+            
+            # Try to fetch and parse the robots.txt
+            response = self.session.get(robots_url, timeout=5)
+            if response.status_code == 200:
+                parser.parse(response.text.splitlines())
+                logging.info(f"✅ Parsed robots.txt for {base_url}")
+            else:
+                logging.warning(f"⚠️ No robots.txt available at {robots_url}")
+                # If no robots.txt, assume everything is allowed
+                parser = RobotFileParser()
+                parser.allow_all = True
+                
+            # Cache the parser
+            self.robots_cache[base_url] = (parser, time.time())
+            return parser
+            
+        except Exception as e:
+            logging.error(f"❌ Error fetching robots.txt for {base_url}: {e}")
+            # On error, be permissive (allow all)
+            parser = RobotFileParser()
+            parser.allow_all = True
+            self.robots_cache[base_url] = (parser, time.time())
+            return parser
+
+    def can_fetch(self, url):
+        """Check if a URL is allowed by robots.txt"""
+        parser = self.get_robots_parser(url)
+        can_fetch = parser.can_fetch("*", url)
+        
+        if not can_fetch:
+            logging.warning(f"🚫 URL disallowed by robots.txt: {url}")
+            self.failed_count += 1
+            return False
+        
+        # Check for and respect crawl delay
+        crawl_delay = parser.crawl_delay("*")
+        if crawl_delay and crawl_delay > self.delay:
+            logging.info(f"⏱️ Respecting robots.txt crawl delay of {crawl_delay}s for {urlparse(url).netloc}")
+            self.delay = crawl_delay
+            
+        return True
+
     def fetch_page(self, url):
         """Fetch a web page with error handling"""
+        # First check robots.txt
+        if not self.can_fetch(url):
+            return None
+
         try:
             logging.info(f"🌐 Fetching: {url}")
             response = self.session.get(url, timeout=10)
