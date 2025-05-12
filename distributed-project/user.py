@@ -59,7 +59,7 @@ def normalize_url(url):
         logger.error(f"Error normalizing URL {url}: {e}")
         return url  # Return original on error
 
-def send_urls_to_master(urls):
+def send_urls_to_master(urls, depth_limit, restrict_domain=True):
     """Send URLs directly to the SQS queue that the master node monitors"""
     if not urls:
         print(f"{Fore.YELLOW}No URLs provided.{Style.RESET_ALL}")
@@ -78,7 +78,12 @@ def send_urls_to_master(urls):
             
         try:
             # Format message the same way the master node expects it
-            message = json.dumps({"url": normalized_url})
+            message = json.dumps({
+            "url": normalized_url,
+            "depth": 0,
+            "depth_limit": depth_limit,
+            "restrict_domain": restrict_domain
+        })
             
             # Send directly to the SQS queue
             sqs.send_message(QueueUrl=CRAWLER_QUEUE_URL, MessageBody=message)
@@ -167,7 +172,12 @@ def main_menu():
             if choice == '1':
                 url_input = input(f"{Fore.GREEN}Enter URLs (comma-separated): {Style.RESET_ALL}")
                 urls = [u.strip() for u in url_input.split(',') if u.strip()]
-                send_urls_to_master(urls)
+                
+                depth_limit = int(input("Enter depth limit (e.g., 2): ") or "2")
+                restrict_domain = input("Restrict to same domain? (y/n): ").lower().startswith("y")
+
+                send_urls_to_master(urls, depth_limit, restrict_domain)
+
                 
             elif choice == '2':
                 launch_dashboard()

@@ -252,14 +252,19 @@ def poll_and_crawl():
 
             for message in messages['Messages']:
                 try:
-                    # Process message body
                     raw_body = message['Body']
                     try:
                         body = json.loads(raw_body)
                         url = body.get('url')
+                        depth = body.get('depth', 0)
+                        depth_limit = body.get('depth_limit', 0)
+                        restrict_domain = body.get('restrict_domain', True)
                     except json.JSONDecodeError:
                         url = raw_body.strip()
                         logging.info(f"Processing plain URL: {url}")
+                        depth = 0
+                        depth_limit = 0
+                        restrict_domain = True
 
                     if not url:
                         logging.warning("⚠️ No URL in message")
@@ -274,6 +279,27 @@ def poll_and_crawl():
                         links = crawler.extract_links(html, url)
                         logging.info(f"🔍 Crawled {url}, found {len(links)} links")
 
+                        # Re-queue discovered links if under depth limit
+                        depth = body.get("depth", 0)
+                        depth_limit = body.get("depth_limit", 0)
+                        restrict_domain = body.get("restrict_domain", False)
+
+                        if depth < depth_limit:
+                            for link in links:
+                                if restrict_domain:
+                                    if urlparse(link).netloc != urlparse(url).netloc:
+                                        continue
+                                message = json.dumps({
+                                    "url": link,
+                                    "depth": depth + 1,
+                                    "depth_limit": depth_limit,
+                                    "restrict_domain": restrict_domain
+                                })
+                                try:
+                                    sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=message)
+                                    logging.info(f"🔗 Discovered link queued: {link}")
+                                except Exception as e:
+                                    logging.error(f"❌ Failed to queue discovered link: {e}")
                 except Exception as e:
                     logging.error(f"❌ Error processing message: {e}")
                     crawler.failed_count += 1

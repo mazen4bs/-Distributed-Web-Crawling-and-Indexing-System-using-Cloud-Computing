@@ -30,7 +30,7 @@ class MasterNode:
         self.stats = {"total_urls": 0, "requeued": 0, "active_crawlers": 0, "failed_crawlers": 0}
         self.seed_urls = []  # Store seed URLs
 
-    def add_urls_to_queue(self, urls, source="seed"):
+    def add_urls_to_queue(self, urls, source="seed", depth=0, depth_limit=0, restrict_domain=True):
         """Add URLs to the crawl queue
         
         Args:
@@ -47,8 +47,12 @@ class MasterNode:
             
             if url not in self.visited_urls:
                 self.visited_urls.add(url)
-                message = json.dumps({"url": url})
-                
+                message = json.dumps({
+                    "url": url,
+                    "depth": depth,
+                    "depth_limit": depth_limit,
+                    "restrict_domain": restrict_domain
+                })
                 try:
                     sqs.send_message(QueueUrl=CRAWLER_QUEUE_URL, MessageBody=message)
                     self.task_status[url] = {"timestamp": time.time(), "status": "queued"}
